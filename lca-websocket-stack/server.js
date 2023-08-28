@@ -329,7 +329,7 @@ console.log('WebSocket server is running on ws://localhost:8080');
 
 app.get('/health/check', (req, res) => {
   const cpuUsage = os.loadavg()[0] / os.cpus().length * 100;
-  if (cpuUsage > CPU_HEALTH) {
+  if (cpuUsage > CPU_HEALTH_THRESHOLD) {
     res.status(503).send('Unhealthy');
   } else {
     res.status(200).send('Healthy');

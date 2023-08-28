@@ -17,7 +17,7 @@ token = os.getenv('JWT_TOKEN', '')
 ws_endpoint = "ws://localhost:8080"
 
 # Set wave file path
-wave_file_path = "../example_call_2_channel.wav"
+wave_file_path = "../../../lca-websocket-stack/example_call_2_channel.wav"
 
 # Read wave file
 with wave.open(wave_file_path, 'rb') as wave_file:

@@ -26,11 +26,12 @@ Parameters:
       - Amazon Chime SDK Voice Connector (SIPREC)
       - Genesys Cloud Audiohook Web Socket
       - Amazon Connect Contact Lens
+      - LCA Web Socket
     Description: >
       Choose whether to automatically install a demo Asterisk PBX server for easy standalone testing, an
       Amazon Chime SDK Voice Connector to use for standards based SIPREC/NBR integration with your contact center,
       a Web Socket interface to use for Audiohook integration with your Genesys Cloud CX contact center, 
-      or integrate with Amazon Connect Contact Lens.
+      integrate with Amazon Connect Contact Lens, or use a Web Socket Client to stream your audio.
 
   CallAudioProcessor:
     Type: String
@@ -700,6 +701,8 @@ Conditions:
     ]
   ShouldInstallGenesysAudiohookStack:
     !Equals [!Ref CallAudioSource, 'Genesys Cloud Audiohook Web Socket']
+  ShouldInstallWebSocketStack:
+    !Equals [!Ref CallAudioSource, 'LCA Web Socket']
   ShouldInstallConnectIntegrationStack:
     !Equals [!Ref CallAudioSource, 'Amazon Connect Contact Lens']
   ShouldUseChimeCallAnalytics:
@@ -1114,9 +1117,10 @@ Resources:
 
   WEBSOCKETSTACK:
     Type: AWS::CloudFormation::Stack
+    Condition: ShouldInstallWebSocketStack
     Properties:
       # yamllint disable rule:line-length
-      TemplateURL: https://s3.<REGION_TOKEN>.amazonaws.com/<ARTIFACT_BUCKET_TOKEN>/<ARTIFACT_PREFIX_TOKEN>/lca-websocket/lca-websocket.yaml
+      TemplateURL: https://s3.<REGION_TOKEN>.amazonaws.com/<ARTIFACT_BUCKET_TOKEN>/<ARTIFACT_PREFIX_TOKEN>/lca-websocket-stack/lca-websocket.yaml
       # yamllint enable rule:line-length
       Parameters:
         S3BucketName: !GetAtt AISTACK.Outputs.S3BucketName

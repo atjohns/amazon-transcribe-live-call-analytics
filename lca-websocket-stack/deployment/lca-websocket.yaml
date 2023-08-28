@@ -198,7 +198,45 @@ Outputs:
               - ''
               - - 'wss://'
                 - !GetAtt WebSocketCloudFrontDistribution.DomainName
-                - '/api/v1/audiohook/ws'
+                - '/api/v1'
+
+Mappings:
+  # aws ec2 describe-managed-prefix-lists  --region <REGION> | jq -r '.PrefixLists[] | select (.PrefixListName == "com.amazonaws.global.cloudfront.origin-facing") | .PrefixListId'
+  AWSRegions2PrefixListID:
+    ap-northeast-1:
+      PrefixList: pl-58a04531
+    ap-northeast-2:
+      PrefixList: pl-22a6434b
+    ap-northeast-3:
+      PrefixList: pl-31a14458
+    ap-south-1:
+      PrefixList: pl-9aa247f3
+    ap-southeast-1:
+      PrefixList: pl-31a34658
+    ap-southeast-2:
+      PrefixList: pl-b8a742d1
+    ca-central-1:
+      PrefixList: pl-38a64351
+    eu-central-1:
+      PrefixList: pl-a3a144ca
+    eu-north-1:
+      PrefixList: pl-fab65393
+    eu-west-1:
+      PrefixList: pl-4fa04526
+    eu-west-2:
+      PrefixList: pl-93a247fa
+    eu-west-3:
+      PrefixList: pl-75b1541c
+    sa-east-1:
+      PrefixList: pl-5da64334
+    us-east-1:
+      PrefixList: pl-3b927c52
+    us-east-2:
+      PrefixList: pl-b6a144df
+    us-west-1:
+      PrefixList: pl-4ea04527
+    us-west-2:
+      PrefixList: pl-82a045eb
 
 Resources:
   ##########################################################################
@@ -805,11 +843,11 @@ Resources:
     Properties:
       GroupDescription: Security Group for ELB  
       SecurityGroupIngress:
-        - CidrIp: 0.0.0.0/0
-          Description: Allow from anyone on port 80
+        - SourcePrefixListId: !FindInMap [AWSRegions2PrefixListID, !Ref 'AWS::Region', PrefixList]
+          Description: Allow HTTP from com.amazonaws.global.cloudfront.origin-facing
           FromPort: 80
           IpProtocol: tcp
-          ToPort: 80      
+          ToPort: 80
       VpcId: !Ref TranscribingVPC
  
   TranscribingAudiohookLoadBalancerSecurityGroupEgress:
@@ -827,6 +865,22 @@ Resources:
           - GroupId
       FromPort: 8080
       ToPort: 8080
+
+  TranscribingAudiohookLoadBalancerSecurityGroupEgress2:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId:
+        Fn::GetAtt:
+          - TranscribingAudiohookLoadBalancerSecurityGroup
+          - GroupId
+      IpProtocol: tcp
+      Description: Load balancer to target
+      DestinationSecurityGroupId:
+        Fn::GetAtt:
+          - TranscriberAudiohookFargateServiceSecurityGroup
+          - GroupId
+      FromPort: 80
+      ToPort: 80
 
   TranscribingAudiohookLoadBalancerListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
@@ -848,11 +902,12 @@ Resources:
       HealthCheckEnabled: true
       HealthCheckIntervalSeconds: 10
       HealthCheckPath: "/health/check"
+      HealthCheckPort: 80
       HealthCheckTimeoutSeconds: 4
       HealthyThresholdCount: 2
       Matcher:
         HttpCode: '200'
-      Port: 80
+      Port: 8080
       Protocol: HTTP
       TargetGroupAttributes:
         - Key: stickiness.enabled
@@ -878,7 +933,7 @@ Resources:
         - Field: path-pattern
           PathPatternConfig:
             Values:
-              - "/*"
+              - "/api/*"
       ListenerArn:
         Ref: TranscribingAudiohookLoadBalancerListener
       Priority: 100
@@ -930,6 +985,13 @@ Resources:
               - transcribe:StartStreamTranscription
               - transcribe:StartTranscriptionJob
               - transcribe:StartCallAnalyticsStreamTranscription
+            Effect: Allow
+            Resource: "*"
+          - Action:
+              - ssmmessages:CreateControlChannel
+              - ssmmessages:CreateDataChannel
+              - ssmmessages:OpenControlChannel
+              - ssmmessages:OpenDataChannel
             Effect: Allow
             Resource: "*"
           - Action:
@@ -1067,6 +1129,8 @@ Resources:
           PortMappings:
             - ContainerPort: 8080
               Protocol: tcp
+            - ContainerPort: 80
+              Protocol: tcp
       Cpu: 2048
       ExecutionRoleArn: !GetAtt TranscriberAudiohookTaskDefExecutionRole.Arn
       Family: !Sub ${AWS::StackName}TranscriberAudiohookTaskDef
@@ -1149,6 +1213,7 @@ Resources:
       DesiredCount: 1
       HealthCheckGracePeriodSeconds: 60
       EnableECSManagedTags: false
+      EnableExecuteCommand: true
       LaunchType: FARGATE
       LoadBalancers:
         - ContainerName: audiohookcontainer
@@ -1199,6 +1264,22 @@ Resources:
           - TranscribingAudiohookLoadBalancerSecurityGroup
           - GroupId
       ToPort: 8080
+
+  TranscriberAudiohookFargateServiceSecurityGroupIngress2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      Description: Load balancer to health check
+      FromPort: 80
+      GroupId:
+        Fn::GetAtt:
+          - TranscriberAudiohookFargateServiceSecurityGroup
+          - GroupId
+      SourceSecurityGroupId:
+        Fn::GetAtt:
+          - TranscribingAudiohookLoadBalancerSecurityGroup
+          - GroupId
+      ToPort: 80
 
   TranscriberAudiohookFargateServiceTaskCountTarget:
     Type: AWS::ApplicationAutoScaling::ScalableTarget
