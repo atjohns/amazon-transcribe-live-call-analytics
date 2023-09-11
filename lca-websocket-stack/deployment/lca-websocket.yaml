@@ -161,6 +161,14 @@ Parameters:
       Artifacts version (semver). Used to point to a specific release in the S3
       bootstrap bucket
 
+  WebSocketInstanceType:
+    Description: Instance type to launch EC2 instances.
+    Type: String
+    Default: c6g.large
+    AllowedValues: [c6g.medium, c6g.large, c6g.xlarge, c6g.2xlarge]
+  WebSocketLatestImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: '/aws/service/canonical/ubuntu/server/jammy/stable/current/arm64/hvm/ebs-gp2/ami-id'
 
 Metadata:
   "AWS::CloudFormation::Interface":
@@ -239,316 +247,6 @@ Mappings:
       PrefixList: pl-82a045eb
 
 Resources:
-  ##########################################################################
-  # CodeBuild
-  ##########################################################################
-  TranscriberECRRepository:
-    Type: AWS::ECR::Repository
-    Properties:
-      ImageScanningConfiguration:
-        ScanOnPush: "true"
-      RepositoryPolicyText:
-        Version: "2012-10-17"
-        Statement:
-          - Sid: "Allow Amazon ECR read access to the users of this AWS account"
-            Effect: Allow
-            Principal:
-              AWS:
-                - !Sub ${AWS::AccountId}
-            Action:
-              - "ecr:GetDownloadUrlForLayer"
-              - "ecr:BatchGetImage"
-              - "ecr:BatchCheckLayerAvailability"
-
-  EcrImagesDeleteLambdaRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: deleteEcrImages
-          PolicyDocument:
-            Version: 2012-10-17
-            Statement:
-              - Effect: Allow
-                Resource:
-                  - !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/\
-                    ${TranscriberECRRepository}"
-                Action:
-                  - ecr:DescribeImages
-                  - ecr:ListImages
-                  - ecr:BatchGetImage
-                  - ecr:BatchDeleteImage
-
-  EcrImagesDeleteLambda:
-    Type: AWS::Lambda::Function
-    Properties:
-      Handler: index.lambda_handler
-      Runtime: python3.9
-      MemorySize: 128
-      Timeout: 60
-      Role: !GetAtt EcrImagesDeleteLambdaRole.Arn
-      Code:
-        ZipFile: |
-          import boto3
-          import cfnresponse
-          client = boto3.client("ecr")
-          def delete_ecr_images(repository_name):
-              print(f"Deleting images in ECR repo {repository_name}")
-              list_image_paginator = client.get_paginator("list_images")
-              image_filter = {"tagStatus": "ANY"}
-              list_response_iterator = list_image_paginator.paginate(
-                  repositoryName=repository_name, filter=image_filter,
-              )
-              # Iterate over responses and remove untagged images
-              for list_response in list_response_iterator:
-                  images = list_response.get("imageIds", [])
-                  if images:
-                      print(f"Deleting images: {images}")
-                      delete_response = client.batch_delete_image(
-                          repositoryName=repository_name, imageIds=images,
-                      )
-                      if delete_response.get("failures"):
-                          print(f"Delete failures: {delete_response.get('failures')}")
-                      else:
-                          print("Done")
-          def lambda_handler(event, context):
-              print(event)
-              status = cfnresponse.SUCCESS
-              response_data = {}
-              reason = "Success"
-              if event["RequestType"] == "Delete":
-                  try:
-                      repository_name = event["ResourceProperties"]["RepositoryName"]
-                      delete_ecr_images(repository_name)
-                      response_data["RepositoryName"] = repository_name
-                  except Exception as e:
-                      print(e)
-                      reason = f"Exception thrown: {e}"
-                      status = cfnresponse.FAILED
-              cfnresponse.send(event, context, status, response_data, reason=reason)
-
-  EcrImagesDelete:
-    Type: Custom::EcrImagesDelete
-    Properties:
-      ServiceToken: !GetAtt EcrImagesDeleteLambda.Arn
-      RepositoryName: !Ref TranscriberECRRepository
-
-  TranscriberCodeBuildServiceRole:
-    Type: AWS::IAM::Role
-    Properties:
-      Path: /
-      AssumeRolePolicyDocument:
-        Version: 2012-10-17
-        Statement:
-          - Action: sts:AssumeRole
-            Effect: Allow
-            Principal:
-              Service: codebuild.amazonaws.com
-      Policies:
-        - PolicyName: ecs-service
-          PolicyDocument:
-            Version: 2012-10-17
-            Statement:
-              - Resource:
-                  - !Sub "arn:aws:s3:::${BootstrapBucketBaseName}-${AWS::Region}"
-                  - !Sub "arn:aws:s3:::${BootstrapBucketBaseName}-${AWS::Region}/\
-                    ${BootstrapS3Prefix}/*"
-                Effect: Allow
-                Action:
-                  - s3:GetObject
-                  - s3:GetObjectVersion
-                  - s3:GetBucketAcl
-                  - s3:GetBucketLocation
-                  - s3:PutObject
-                  - s3:ListBucket
-              - Resource:
-                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*"
-                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:\
-                    /aws/codebuild/*:*"
-                Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-              - Resource:
-                  !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/\
-                  ${TranscriberECRRepository}"
-                Effect: Allow
-                Action:
-                  - ecr:DescribeImages
-                  - ecr:ListImages
-                  - ecr:PutImage
-                  - ecr:BatchCheckLayerAvailability
-                  - ecr:BatchGetImage
-                  - ecr:CompleteLayerUpload
-                  - ecr:GetDownloadUrlForLayer
-                  - ecr:GetRepositoryPolicy
-                  - ecr:InitiateLayerUpload
-                  - ecr:UploadLayerPart
-              - Resource: "*"
-                Effect: Allow
-                Action:
-                  - ecr:GetAuthorizationToken
-
-    Metadata:
-      cfn_nag:
-        rules_to_suppress:
-          - id: W11
-            reason: >-
-              ECR do not support resource-level permissions for GetAuthorizationToken and therefore
-              cannot be specificed directly.
-  
-
-  TranscriberCodeBuildProject:
-    Type: AWS::CodeBuild::Project
-    Properties:
-      Description: !Sub >-
-        Builds docker images : ${AWS::StackName}
-      ServiceRole: !Ref TranscriberCodeBuildServiceRole
-      EncryptionKey: alias/aws/s3
-      Artifacts:
-        Type: NO_ARTIFACTS
-      Source:
-        Location:
-          !Sub "arn:aws:s3:::${BootstrapBucketBaseName}-${AWS::Region}/${BootstrapS3Prefix}/\
-          lca-websocket.zip"
-        Type: S3
-        BuildSpec: |
-          version: 0.2
-          phases:
-            pre_build:
-              commands:
-                - echo ${SOURCE_CODE_LOCATION}
-                - echo `pwd`
-                - echo `ls -lhrt`
-                - echo Logging in to Amazon ECR...
-                - >
-                  aws ecr get-login-password --region $AWS_DEFAULT_REGION |
-                  docker login --username AWS
-                  --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
-            build:
-              commands:
-                - echo Build started on `date`
-                - echo Building Genesys audiohook container image
-                - cd $CODEBUILD_SRC_DIR
-                - echo `pwd`
-                - docker build -t "${REPOSITORY_URI}:${IMAGE_TAG}" .
-                - >
-                  printf '{"RepositoryUri":"%s","ProjectName":"%s","ArtifactBucket":"%s"}'
-                  $REPOSITORY_URI $PROJECT_NAME $ARTIFACT_BUCKET > build.json
-            post_build:
-              commands:
-                - echo Build completed on `date`
-                - echo "Pushing Docker image to ECR"
-                - docker push "${REPOSITORY_URI}:${IMAGE_TAG}"
-
-          artifacts:
-            files:
-              - build.json
-      Environment:
-        ComputeType: BUILD_GENERAL1_MEDIUM
-        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
-        Type: LINUX_CONTAINER
-        PrivilegedMode: True
-        EnvironmentVariables:
-          - Name: AWS_DEFAULT_REGION
-            Value: !Ref AWS::Region
-          - Name: AWS_ACCOUNT_ID
-            Value: !Ref AWS::AccountId
-          - Name: REPOSITORY_URI
-            Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}\
-              .amazonaws.com/${TranscriberECRRepository}"
-          - Name: IMAGE_TAG
-            Value: !Ref BootstrapVersion
-          - Name: SOURCE_CODE_LOCATION
-            Value: !Sub "${BootstrapBucketBaseName}-${AWS::Region}/\
-              ${BootstrapS3Prefix}/${BootstrapVersion}"
-      TimeoutInMinutes: 10
-
-  LambdaCodeBuildStartBuildExecutionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service:
-                - lambda.amazonaws.com
-            Action:
-              - sts:AssumeRole
-      Path: "/"
-      Policies:
-        - PolicyName: root
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action:
-                  - codebuild:StartBuild
-                  - codebuild:BatchGetBuilds
-                Resource: !GetAtt TranscriberCodeBuildProject.Arn
-              - Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource:
-                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:\
-                    /aws/lambda/*"
-        # Used by custom resource helper poller
-        # https://github.com/aws-cloudformation/custom-resource-helper
-        - PolicyName: CustomResourcePoller
-          PolicyDocument:
-            Version: 2012-10-17
-            Statement:
-              - Effect: Allow
-                Action:
-                  - events:PutRule
-                  - events:DeleteRule
-                  - events:PutTargets
-                  - events:RemoveTargets
-                Resource:
-                  - !Sub "arn:${AWS::Partition}:events:${AWS::Region}:\
-                    ${AWS::AccountId}:rule/*"
-              - Effect: Allow
-                Action:
-                  - lambda:AddPermission
-                  - lambda:RemovePermission
-                Resource:
-                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:\
-                    ${AWS::AccountId}:function:*"
-
-  CodeBuildRun:
-    Type: Custom::CodeBuildRun
-    Properties:
-      ServiceToken: !GetAtt LambdaCodeBuildStartBuild.Arn
-      BuildProjectName: !Ref TranscriberCodeBuildProject
-
-  LambdaCodeBuildStartBuild:
-    Type: AWS::Serverless::Function
-    Properties:
-      Role: !GetAtt LambdaCodeBuildStartBuildExecutionRole.Arn
-      Runtime: python3.9
-      Timeout: 60
-      MemorySize: 128
-      Handler: lambda_start_codebuild.handler
-      CodeUri: ../lambda_functions/start_codebuild
-      Description: This AWS Lambda Function kicks off a code build job.
-    Metadata:
-      cfn_nag:
-        rules_to_suppress:
-          - id: W89
-            reason: Customer can use VPC if desired
-
   ##########################################################################
   # VPC
   ##########################################################################
@@ -812,16 +510,6 @@ Resources:
       NatGatewayId:
         Ref: TranscribingVPCPublicSubnet2NATGateway
 
-  ##########################################################################
-  # ELB
-  ##########################################################################
-  TranscribingCluster:
-    Type: AWS::ECS::Cluster
-    Properties:
-      ClusterSettings:
-        - Name: containerInsights
-          Value: enabled
-
   TranscribingAudiohookLoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
@@ -861,7 +549,7 @@ Resources:
       Description: Load balancer to target
       DestinationSecurityGroupId:
         Fn::GetAtt:
-          - TranscriberAudiohookFargateServiceSecurityGroup
+          - TranscriberServiceSecurityGroup
           - GroupId
       FromPort: 8080
       ToPort: 8080
@@ -877,7 +565,7 @@ Resources:
       Description: Load balancer to target
       DestinationSecurityGroupId:
         Fn::GetAtt:
-          - TranscriberAudiohookFargateServiceSecurityGroup
+          - TranscriberServiceSecurityGroup
           - GroupId
       FromPort: 80
       ToPort: 80
@@ -914,7 +602,9 @@ Resources:
           Value: 'false'
         - Key: deregistration_delay.timeout_seconds
           Value: '180'
-      TargetType: ip
+      Targets:
+        - Id: !Ref WebSocketInstance
+          Port: 8080
       UnhealthyThresholdCount: 2
       VpcId: !Ref TranscribingVPC
  
@@ -956,66 +646,6 @@ Resources:
         Ref: TranscribingAudiohookLoadBalancerListener
       Priority: 200
    
-  ##########################################################################
-  # ECS
-  #########################################################################
-
-  TranscriberAudiohookTaskDefTaskRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Statement:
-          - Action: sts:AssumeRole
-            Effect: Allow
-            Principal:
-              Service: ecs-tasks.amazonaws.com
-        Version: "2012-10-17"
-
-  TranscriberAudiohookTaskDefTaskRoleDefaultPolicy:
-    Type: AWS::IAM::Policy
-    Properties:
-      PolicyDocument:
-        Statement:
-          - Action:
-              - transcribe:DeleteTranscriptionJob
-              - transcribe:GetTranscriptionJob
-              - transcribe:GetVocabulary
-              - transcribe:ListTranscriptionJobs
-              - transcribe:ListVocabularies
-              - transcribe:StartStreamTranscription
-              - transcribe:StartTranscriptionJob
-              - transcribe:StartCallAnalyticsStreamTranscription
-            Effect: Allow
-            Resource: "*"
-          - Action:
-              - ssmmessages:CreateControlChannel
-              - ssmmessages:CreateDataChannel
-              - ssmmessages:OpenControlChannel
-              - ssmmessages:OpenDataChannel
-            Effect: Allow
-            Resource: "*"
-          - Action:
-              - kinesis:PutRecord
-            Effect: Allow
-            Resource:  
-              - !Sub 
-                - "arn:${AWS::Partition}:kinesis:${AWS::Region}:${AWS::AccountId}:stream/${streamName}"
-                - streamName: !Ref CallDataStreamName
-          - Action:
-              - logs:CreateLogStream
-              - logs:PutLogEvents
-            Effect: Allow
-            Resource: !GetAtt TranscriberAudiohookTaskDefAudiohookContainerLogGroup.Arn
-        Version: "2012-10-17"
-      PolicyName: !Sub ${AWS::StackName}-TranscriberAudiohookTaskDefTaskRoleDefaultPolicy
-      Roles:
-        - !Ref TranscriberAudiohookTaskDefTaskRole
-    Metadata:
-      cfn_nag:
-        rules_to_suppress:
-          - id: W12
-            reason: comprehend, translate, and connect do not support resource-level permissions.
-
   TcaDataAccessRole:
     Type: AWS::IAM::Role
     Properties:
@@ -1055,190 +685,7 @@ Resources:
             reason: >-
               Transcribe does not support resource-level permissions and KVS streams are dynamic
 
-  TranscriberAudiohookTaskDef:
-    Type: AWS::ECS::TaskDefinition
-    DependsOn: CodeBuildRun
-    Properties:
-      ContainerDefinitions:
-        - Environment:
-            - Name: REGION
-              Value: !Ref AWS::Region
-            - Name: NODE_ENV
-              Value: 'Production'
-            - Name: SERVERHOST
-              Value: '0.0.0.0'
-            - Name: SERVERPORT
-              Value: '8080'
-            - Name: USERPOOL_ID
-              Value: !Ref UserPoolId
-            - Name: OUTPUT_BUCKET
-              Value: !Ref S3BucketName
-            - Name: RECORDING_FILE_PREFIX
-              Value: !Ref AudioFilePrefix
-            - Name: CALL_ANALYTICS_FILE_PREFIX
-              Value: !Ref CallAnalyticsPrefix
-            - Name: RAW_FILE_PREFIX
-              Value: 'lca-audio-raw'
-            - Name: TCA_DATA_ACCESS_ROLE_ARN
-              Value: !GetAtt TcaDataAccessRole.Arn
-            - Name: TEMP_FILE_PATH
-              Value: 'output/'
-            - Name: IS_CONTENT_REDACTION_ENABLED
-              Value: !Ref IsContentRedactionEnabled
-            - Name: TRANSCRIBE_LANGUAGE_CODE
-              Value: !Ref TranscribeLanguageCode
-            - Name: CONTENT_REDACTION_TYPE
-              Value: !Ref TranscribeContentRedactionType
-            - Name: PII_ENTITY_TYPES
-              Value: !Ref TranscribePiiEntityTypes
-            - Name: CUSTOM_VOCABULARY_NAME
-              Value: !Ref CustomVocabularyName
-            - Name: CUSTOM_LANGUAGE_MODEL_NAME
-              Value: !Ref CustomLanguageModelName
-            - Name: KEEP_ALIVE
-              Value: '10000'
-            - Name: TRANSCRIBE_API_MODE
-              Value: !Ref TranscribeApiMode
-            - Name: BUFFER_SIZE
-              Value: '128'
-            - Name: IS_TCA_POST_CALL_ANALYTICS_ENABLED
-              Value: !If
-                - ShouldInstallPcaIntegration
-                - 'true'
-                - 'false'
-            - Name: POST_CALL_CONTENT_REDACTION_OUTPUT
-              Value: 'redacted'
-            - Name: START_STREAM_RETRIES
-              Value: '5'
-            - Name: START_STREAM_RETRY_WAIT
-              Value: '1000'
-            - Name: KINESIS_STREAM_NAME
-              Value: !Ref CallDataStreamName
-          Essential: true
-          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/\
-            ${TranscriberECRRepository}:${BootstrapVersion}"
-          LogConfiguration:
-            LogDriver: awslogs
-            Options:
-              awslogs-group:
-                Ref: TranscriberAudiohookTaskDefAudiohookContainerLogGroup
-              awslogs-stream-prefix: audiohook
-              awslogs-region:
-                Ref: AWS::Region
-          Name: audiohookcontainer
-          PortMappings:
-            - ContainerPort: 8080
-              Protocol: tcp
-            - ContainerPort: 80
-              Protocol: tcp
-      Cpu: 2048
-      ExecutionRoleArn: !GetAtt TranscriberAudiohookTaskDefExecutionRole.Arn
-      Family: !Sub ${AWS::StackName}TranscriberAudiohookTaskDef
-      Memory: 4096
-      NetworkMode: awsvpc
-      RequiresCompatibilities:
-        - FARGATE
-      TaskRoleArn: !GetAtt TranscriberAudiohookTaskDefTaskRole.Arn
-
-  TranscriberAudiohookTaskDefAudiohookContainerLogGroup:
-    Type: AWS::Logs::LogGroup
-    UpdateReplacePolicy: Retain
-    DeletionPolicy: Retain
-    Properties:
-      RetentionInDays: 3653
-    Metadata:
-      cfn_nag:
-        rules_to_suppress:
-          - id: W84
-            reason: >-
-              By default CloudWatchLogs LogGroups data is encrypted using the CloudWatch
-              server-side encryption keys (AWS Managed Keys).
-
-  TranscriberAudiohookTaskDefExecutionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Statement:
-          - Action: sts:AssumeRole
-            Effect: Allow
-            Principal:
-              Service: ecs-tasks.amazonaws.com
-        Version: "2012-10-17"
-
-  TranscriberAudiohookTaskDefExecutionRoleDefaultPolicy:
-    Type: AWS::IAM::Policy
-    Properties:
-      PolicyDocument:
-        Statement:
-          - Action:
-              - ecr:BatchCheckLayerAvailability
-              - ecr:GetDownloadUrlForLayer
-              - ecr:BatchGetImage
-            Effect: Allow
-            Resource:
-              Fn::GetAtt:
-                - TranscriberECRRepository
-                - Arn
-          - Action: ecr:GetAuthorizationToken
-            Effect: Allow
-            Resource: "*"
-          - Action:
-              - logs:CreateLogStream
-              - logs:PutLogEvents
-            Effect: Allow
-            Resource:
-              Fn::GetAtt:
-                - TranscriberAudiohookTaskDefAudiohookContainerLogGroup
-                - Arn
-        Version: "2012-10-17"
-      PolicyName:
-        !Sub "${AWS::StackName}-\
-              TranscriberAudiohookTaskDefExecutionRoleDefaultPolicy"
-      Roles:
-        - Ref: TranscriberAudiohookTaskDefExecutionRole
-    Metadata:
-      cfn_nag:
-        rules_to_suppress:
-          - id: W12
-            reason: comprehend, translate, and connect do not support resource-level permissions.
-
-  TranscriberAudiohookFargateService:
-    Type: AWS::ECS::Service
-    Properties:
-      Cluster:
-        Ref: TranscribingCluster
-      DeploymentConfiguration:
-        MaximumPercent: 200
-        MinimumHealthyPercent: 50
-      DesiredCount: 1
-      HealthCheckGracePeriodSeconds: 60
-      EnableECSManagedTags: false
-      EnableExecuteCommand: true
-      LaunchType: FARGATE
-      LoadBalancers:
-        - ContainerName: audiohookcontainer
-          ContainerPort: 8080
-          TargetGroupArn:
-            Ref: TranscribingAudiohookLoadBalancerListenerTargetGroup
-      NetworkConfiguration:
-        AwsvpcConfiguration:
-          AssignPublicIp: DISABLED
-          SecurityGroups:
-            - Fn::GetAtt:
-                - TranscriberAudiohookFargateServiceSecurityGroup
-                - GroupId
-          Subnets:
-            - Ref: TranscribingVPCPrivateSubnet1Subnet
-            - Ref: TranscribingVPCPrivateSubnet2Subnet
-      TaskDefinition:
-        Ref: TranscriberAudiohookTaskDef
-    DependsOn:
-      - TranscribingAudiohookLoadBalancerListenerTargetGroup
-      - TranscribingAudiohookLoadBalancerListenerRule1
-      - TranscribingAudiohookLoadBalancerListenerRule2
-      - TranscribingAudiohookLoadBalancerListener
-
-  TranscriberAudiohookFargateServiceSecurityGroup:
+  TranscriberServiceSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: audiohook-fargate/service/Service/SecurityGroup
@@ -1248,8 +695,7 @@ Resources:
           IpProtocol: "-1"
       VpcId: !Ref TranscribingVPC
 
-
-  TranscriberAudiohookFargateServiceSecurityGroupIngress:
+  TranscriberServiceSecurityGroupIngress:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
       IpProtocol: tcp
@@ -1257,7 +703,7 @@ Resources:
       FromPort: 8080
       GroupId:
         Fn::GetAtt:
-          - TranscriberAudiohookFargateServiceSecurityGroup
+          - TranscriberServiceSecurityGroup
           - GroupId
       SourceSecurityGroupId:
         Fn::GetAtt:
@@ -1265,7 +711,7 @@ Resources:
           - GroupId
       ToPort: 8080
 
-  TranscriberAudiohookFargateServiceSecurityGroupIngress2:
+  TranscriberServiceSecurityGroupIngress2:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
       IpProtocol: tcp
@@ -1273,43 +719,13 @@ Resources:
       FromPort: 80
       GroupId:
         Fn::GetAtt:
-          - TranscriberAudiohookFargateServiceSecurityGroup
+          - TranscriberServiceSecurityGroup
           - GroupId
       SourceSecurityGroupId:
         Fn::GetAtt:
           - TranscribingAudiohookLoadBalancerSecurityGroup
           - GroupId
       ToPort: 80
-
-  TranscriberAudiohookFargateServiceTaskCountTarget:
-    Type: AWS::ApplicationAutoScaling::ScalableTarget
-    Properties:
-      MaxCapacity: 3
-      MinCapacity: 1
-      ResourceId:
-        !Sub "service/${TranscribingCluster}/\
-              ${TranscriberAudiohookFargateService.Name}"
-      RoleARN:
-        !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/\
-        ecs.application-autoscaling.amazonaws.com/\
-        AWSServiceRoleForApplicationAutoScaling_ECSService"
-      ScalableDimension: ecs:service:DesiredCount
-      ServiceNamespace: ecs
-
-  TranscriberAudiohookFargateServiceTaskCountTargetCpuScaling:
-    Type: AWS::ApplicationAutoScaling::ScalingPolicy
-    Properties:
-      PolicyName: !Sub "${AWS::StackName}\
-        TranscriberAudiohookFargateServiceTaskCountTargetCpuScaling"
-      PolicyType: TargetTrackingScaling
-      ScalingTargetId:
-        Ref: TranscriberAudiohookFargateServiceTaskCountTarget
-      TargetTrackingScalingPolicyConfiguration:
-        PredefinedMetricSpecification:
-          PredefinedMetricType: ECSServiceAverageCPUUtilization
-        ScaleInCooldown: 60
-        ScaleOutCooldown: 60
-        TargetValue: 50
 
   CloudFrontOriginAccessIdentity:
     Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
@@ -1393,3 +809,177 @@ Resources:
           - id: W70
             reason: This is using Cloudfront default TLS, can be changed by customer if needed.
 
+  WebSocketInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - Ref: WebSocketInstanceRole
+
+  WebSocketInstanceTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref WebSocketLatestImageId
+        InstanceType: !Ref WebSocketInstanceType
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+
+  WebSocketInstance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+        Count: '1'
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebSocketInstanceTemplate
+        Version: !GetAtt WebSocketInstanceTemplate.LatestVersionNumber
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: ''
+      IamInstanceProfile:
+        Ref: WebSocketInstanceProfile
+      SecurityGroupIds:
+        - Fn::GetAtt:
+            - TranscriberServiceSecurityGroup
+            - GroupId
+      SubnetId:
+        Ref: TranscribingVPCPublicSubnet1Subnet
+      Tags:
+        - Key: Name
+          Value: !Sub 'WebSocketInstance-${AWS::StackName}'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo apt-get update
+          while fuser /var/lib/dpkg/lock >/dev/null 2>&1 ; do sleep 1 ; done
+          sudo apt-get install unzip python3-pip jq nodejs npm -y
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o "awscliv2.zip"
+          unzip -q  -o awscliv2.zip
+          sudo ./aws/install --update
+          mkdir -p /opt/aws/
+          sudo pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+          sudo ln -s -f /usr/local/init/ubuntu/cfn-hup /etc/init.d/cfn-hup
+          /usr/local/bin/cfn-init -v  --stack ${AWS::StackName} --resource WebSocketInstance --configsets full_install  --region ${AWS::Region}          
+          
+          echo export DB_CONNECTION="some DB connection" >> /etc/profile
+          echo export DB_USERNAME="my user" >> /etc/profile
+          echo export DB_PASSWORD="my password" >> /etc/profile
+          echo export REGION=${AWS::Region}
+          echo export NODE_ENV='Production' >> /etc/profile
+          echo export SERVERHOST='0.0.0.0' >> /etc/profile
+          echo export SERVERPORT='8080' >> /etc/profile
+          echo export USERPOOL_ID=${UserPoolId} >> /etc/profile
+          echo export OUTPUT_BUCKET=${S3BucketName} >> /etc/profile
+          echo export RECORDING_FILE_PREFIX=${AudioFilePrefix} >> /etc/profile
+          echo export CALL_ANALYTICS_FILE_PREFIX=${CallAnalyticsPrefix} >> /etc/profile
+          echo export RAW_FILE_PREFIX='lca-audio-raw' >> /etc/profile
+          echo export TCA_DATA_ACCESS_ROLE_ARN=${TcaDataAccessRole.Arn} >> /etc/profile
+          echo export TEMP_FILE_PATH='output/' >> /etc/profile
+          echo export IS_CONTENT_REDACTION_ENABLED=${IsContentRedactionEnabled} >> /etc/profile
+          echo export TRANSCRIBE_LANGUAGE_CODE=${TranscribeLanguageCode} >> /etc/profile
+          echo export CONTENT_REDACTION_TYPE=${TranscribeContentRedactionType} >> /etc/profile
+          echo export PII_ENTITY_TYPES=${TranscribePiiEntityTypes} >> /etc/profile
+          echo export CUSTOM_VOCABULARY_NAME=${CustomVocabularyName} >> /etc/profile
+          echo export CUSTOM_LANGUAGE_MODEL_NAME=${CustomLanguageModelName} >> /etc/profile
+          echo export KEEP_ALIVE='10000' >> /etc/profile
+          echo export TRANSCRIBE_API_MODE=${TranscribeApiMode} >> /etc/profile
+          echo export BUFFER_SIZE='128' >> /etc/profile
+          echo export IS_TCA_POST_CALL_ANALYTICS_ENABLED='true' >> /etc/profile
+          echo export POST_CALL_CONTENT_REDACTION_OUTPUT='redacted' >> /etc/profile
+          echo export START_STREAM_RETRIES='5' >> /etc/profile
+          echo export START_STREAM_RETRY_WAIT='1000' >> /etc/profile
+          echo export KINESIS_STREAM_NAME=${CallDataStreamName} >> /etc/profile
+          aws s3 cp s3://${BootstrapBucketBaseName}-${AWS::Region}/${BootstrapS3Prefix}/lca-websocket.zip .
+          unzip lca-websocket.zip
+          sudo apt-get update && sudo apt-get install -y ca-certificates curl gnupg
+          curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+          NODE_MAJOR=20
+          echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_$NODE_MAJOR.x nodistro main" | sudo tee /etc/apt/sources.list.d/nodesource.list
+          sudo apt-get update && sudo apt-get install nodejs -y            
+          npm install
+          /usr/local/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource WebSocketInstance --region ${AWS::Region}
+          nohup node server.js > server.out 2>&1 &
+    DependsOn:
+          - WebSocketInstanceDefaultPolicy
+          - WebSocketInstanceRole
+
+  WebSocketEIP:
+    Type: AWS::EC2::EIP
+
+  WebSocketEIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      EIP:
+        Ref: WebSocketEIP
+      InstanceId:
+        Ref: WebSocketInstance
+
+  WebSocketInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                Fn::Join:
+                  - ''
+                  - - ec2.
+                    - Ref: AWS::URLSuffix
+        Version: '2012-10-17'
+      ManagedPolicyArns:
+        - Fn::Join:
+            - ''
+            - - 'arn:'
+              - Ref: AWS::Partition
+              - :iam::aws:policy/AmazonSSMManagedInstanceCore
+  WebSocketInstanceDefaultPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Resource:
+              - !Sub "arn:aws:s3:::${BootstrapBucketBaseName}-${AWS::Region}"
+              - !Sub "arn:aws:s3:::${BootstrapBucketBaseName}-${AWS::Region}/\
+                    ${BootstrapS3Prefix}/*"
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:GetBucketAcl
+              - s3:GetBucketLocation
+              - s3:PutObject
+              - s3:ListBucket
+          - Action:
+              - transcribe:DeleteTranscriptionJob
+              - transcribe:GetTranscriptionJob
+              - transcribe:GetVocabulary
+              - transcribe:ListTranscriptionJobs
+              - transcribe:ListVocabularies
+              - transcribe:StartStreamTranscription
+              - transcribe:StartTranscriptionJob
+              - transcribe:StartCallAnalyticsStreamTranscription
+            Effect: Allow
+            Resource: "*"
+          - Action:
+              - ssmmessages:CreateControlChannel
+              - ssmmessages:CreateDataChannel
+              - ssmmessages:OpenControlChannel
+              - ssmmessages:OpenDataChannel
+            Effect: Allow
+            Resource: "*"
+          - Action:
+              - kinesis:PutRecord
+            Effect: Allow
+            Resource:
+              - !Sub
+                - "arn:${AWS::Partition}:kinesis:${AWS::Region}:${AWS::AccountId}:stream/${streamName}"
+                - streamName: !Ref CallDataStreamName
+        Version: '2012-10-17'
+      PolicyName: WebSocketInstanceDefaultPolicy
+      Roles:
+        - Ref: WebSocketInstanceRole
